@@ -108,4 +108,6 @@ private:
 
 	/** The settings for Git source control */
 	FGitSourceControlSettings GitSourceControlSettings;
+
+	FDelegateHandle ContentBrowserAssetExtenderDelegateHandle;
 };
