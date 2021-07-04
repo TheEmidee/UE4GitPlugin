@@ -241,4 +241,6 @@ bool UpdateCachedStates(const TArray<FString>& InFiles, EWorkingCopyState::Type 
  */
 bool GetAllLocks(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool bAbsolutePaths, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache = false);
 
+
+TSharedPtr<class ISourceControlRevision, ESPMode::ThreadSafe > GetOriginDevelopRevision( const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString & InRelativeFileName, TArray<FString>& OutErrorMessages );
 }
