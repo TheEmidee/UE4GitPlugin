@@ -7,9 +7,12 @@
 
 #include "CoreMinimal.h"
 
+#include "GitSourceControlState.h"
+
 class IGitSourceControlWorker
 {
 public:
+
 	/**
 	 * Name describing the work that this worker does. Used for factory method hookup.
 	 */

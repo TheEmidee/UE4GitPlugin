@@ -7,6 +7,7 @@
 
 #include "CoreMinimal.h"
 #include "ISourceControlProvider.h"
+#include "Runtime/Launch/Resources/Version.h"
 
 class FToolBarBuilder;
 class FMenuBuilder;
@@ -19,6 +20,7 @@ public:
 	void Unregister();
 	
 	/** This functions will be bound to appropriate Command. */
+	void CommitClicked();
 	void PushClicked();
 	void SyncClicked();
 	void RevertClicked();
@@ -32,11 +34,6 @@ private:
 	bool HaveRemoteUrl() const;
 
 	bool				SaveDirtyPackages();
-	TArray<FString>		ListAllPackages();
-	TArray<UPackage*>	UnlinkPackages(const TArray<FString>& InPackageNames);
-
-	/** Hot reload packages, remove deleted packages from memory */
-	static void			ReloadPackages(TArray<UPackage*>& InPackagesToReload);
 
 	bool StashAwayAnyModifications();
 	void ReApplyStashedModifications();
@@ -51,7 +48,11 @@ private:
 	static void DisplayFailureNotification(const FName& InOperationName);
 
 private:
+#if ENGINE_MAJOR_VERSION < 5
 	FDelegateHandle ViewMenuExtenderHandle;
+#else
+	TSharedPtr<FExtender> ViewMenuExtender;
+#endif
 
 	/** Was there a need to stash away modifications before Sync? */
 	bool bStashMadeBeforeSync;

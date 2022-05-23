@@ -9,8 +9,15 @@
 #include "GitSourceControlModule.h"
 #include "GitSourceControlPrivatePCH.h"
 #include "GitSourceControlProvider.h"
-#include "HAL/FileManager.h"
+#include "HAL/PlatformProcess.h"
+
+#if ( ENGINE_MAJOR_VERSION == 5 )
+#include "HAL/PlatformFileManager.h"
+#else
 #include "HAL/PlatformFilemanager.h"
+#endif
+
+#include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "Interfaces/IPluginManager.h"
 #include "ISourceControlModule.h"
@@ -20,12 +27,26 @@
 #include "ISourceControlModule.h"
 #include "GitSourceControlModule.h"
 #include "GitSourceControlProvider.h"
+#include "Logging/MessageLog.h"
 #include "Misc/DateTime.h"
+#include "Misc/ScopeLock.h"
 #include "Misc/Timespan.h"
+
+#include "PackageTools.h"
+#include "FileHelpers.h"
+#include "Misc/MessageDialog.h"
+
+#include "Async/Async.h"
 
 #if PLATFORM_LINUX
 #include <sys/ioctl.h>
 #endif
+
+#ifndef GIT_DEBUG_STATUS
+#define GIT_DEBUG_STATUS 0
+#endif
+
+#define LOCTEXT_NAMESPACE "GitSourceControl"
 
 namespace GitSourceControlConstants
 {
@@ -113,7 +134,7 @@ static bool RunCommandInternalRaw(const FString& InCommand, const FString& InPat
 	UE_LOG(LogSourceControl, Log, TEXT("RunCommand: 'git %s'"), *LogableCommand);
 #endif
 
-	FString PathToGitOrEnvBinary = InPathToGitBinary;
+	const FString& PathToGitOrEnvBinary = InPathToGitBinary;
 #if PLATFORM_MAC
 	// The Cocoa application does not inherit shell environment variables, so add the path expected to have git-lfs to PATH
 	FString PathEnv = FPlatformMisc::GetEnvironmentVariable(TEXT("PATH"));
@@ -137,16 +158,17 @@ static bool RunCommandInternalRaw(const FString& InCommand, const FString& InPat
 		FullCommand = FString::Printf(TEXT("PATH=\"%s%s%s\" \"%s\" %s"), *GitInstallPath, FPlatformMisc::GetPathVarDelimiter(), *PathEnv, *InPathToGitBinary, *FullCommand);
 	}
 #endif
+
 	FPlatformProcess::ExecProcess(*PathToGitOrEnvBinary, *FullCommand, &ReturnCode, &OutResults, &OutErrors);
 
 #if UE_BUILD_DEBUG
 	// TODO: add a setting to easily enable Verbose logging
 	UE_LOG(LogSourceControl, Verbose, TEXT("RunCommand(%s):\n%s"), *InCommand, *OutResults);
-#endif
-	if(ReturnCode != ExpectedReturnCode || OutErrors.Len() > 0)
+	if (ReturnCode != ExpectedReturnCode)
 	{
 		UE_LOG(LogSourceControl, Warning, TEXT("RunCommand(%s) ReturnCode=%d:\n%s"), *InCommand, ReturnCode, *OutErrors);
 	}
+#endif
 
 	// Move push/pull progress information from the error stream to the info stream
 	if(ReturnCode == ExpectedReturnCode && OutErrors.Len() > 0)
@@ -351,18 +373,16 @@ bool CheckGitAvailability(const FString& InPathToGitBinary, FGitVersion* OutVers
 {
 	FString InfoMessages;
 	FString ErrorMessages;
-	bool bGitAvailable = RunCommandInternalRaw(TEXT("version"), InPathToGitBinary, FString(), TArray<FString>(), TArray<FString>(), InfoMessages, ErrorMessages);
+	bool bGitAvailable = RunCommandInternalRaw(TEXT("version"), InPathToGitBinary, FString(), FGitSourceControlModule::GetEmptyStringArray(), FGitSourceControlModule::GetEmptyStringArray(), InfoMessages, ErrorMessages);
 	if (bGitAvailable)
 	{
-		if (!InfoMessages.Contains("git"))
+		if (!InfoMessages.StartsWith("git version"))
 		{
 			bGitAvailable = false;
 		}
 		else if (OutVersion)
 		{
 			ParseGitVersion(InfoMessages, OutVersion);
-			FindGitCapabilities(InPathToGitBinary, OutVersion);
-			FindGitLfsCapabilities(InPathToGitBinary, OutVersion);
 		}
 	}
 
@@ -371,63 +391,52 @@ bool CheckGitAvailability(const FString& InPathToGitBinary, FGitVersion* OutVers
 
 void ParseGitVersion(const FString& InVersionString, FGitVersion* OutVersion)
 {
-	// Parse "git version 2.11.0.windows.3" into the string tokens "git", "version", "2.11.0.windows.3"
-	TArray<FString> TokenizedString;
-	InVersionString.ParseIntoArrayWS(TokenizedString);
-
-	// Select the string token containing the version "2.11.0.windows.3"
-	const FString* TokenVersionStringPtr = TokenizedString.FindByPredicate([](FString& s) { return TChar<TCHAR>::IsDigit(s[0]); });
-	if (TokenVersionStringPtr)
+#if UE_BUILD_DEBUG
+	// Parse "git version 2.31.1.vfs.0.3" into the string "2.31.1.vfs.0.3"
+	const FString& TokenVersionStringPtr = InVersionString.RightChop(12);
+	if (!TokenVersionStringPtr.IsEmpty())
 	{
 		// Parse the version into its numerical components
 		TArray<FString> ParsedVersionString;
-		TokenVersionStringPtr->ParseIntoArray(ParsedVersionString, TEXT("."));
-		if (ParsedVersionString.Num() >= 3)
+		TokenVersionStringPtr.ParseIntoArray(ParsedVersionString, TEXT("."));
+		const int Num = ParsedVersionString.Num();
+		if (Num >= 3)
 		{
 			if (ParsedVersionString[0].IsNumeric() && ParsedVersionString[1].IsNumeric() && ParsedVersionString[2].IsNumeric())
 			{
 				OutVersion->Major = FCString::Atoi(*ParsedVersionString[0]);
 				OutVersion->Minor = FCString::Atoi(*ParsedVersionString[1]);
 				OutVersion->Patch = FCString::Atoi(*ParsedVersionString[2]);
-				if (ParsedVersionString.Num() >= 5)
+				if (Num >= 5)
 				{
-					if ((ParsedVersionString[3] == TEXT("windows")) && ParsedVersionString[4].IsNumeric())
+					// If labeled with fork
+					if (!ParsedVersionString[3].IsNumeric())
 					{
-						OutVersion->Windows = FCString::Atoi(*ParsedVersionString[4]);
+						OutVersion->Fork = ParsedVersionString[3];
+						OutVersion->bIsFork = true;
+						OutVersion->ForkMajor = FCString::Atoi(*ParsedVersionString[4]);
+						if (Num >= 6)
+						{
+							OutVersion->ForkMinor = FCString::Atoi(*ParsedVersionString[5]);
+							if (Num >= 7)
+							{
+								OutVersion->ForkPatch = FCString::Atoi(*ParsedVersionString[6]);
+							}
+						}
 					}
 				}
-				UE_LOG(LogSourceControl, Log, TEXT("Git version %d.%d.%d(%d)"), OutVersion->Major, OutVersion->Minor, OutVersion->Patch, OutVersion->Windows);
+				if (OutVersion->bIsFork)
+				{
+					UE_LOG(LogSourceControl, Log, TEXT("Git version %d.%d.%d.%s.%d.%d.%d"), OutVersion->Major, OutVersion->Minor, OutVersion->Patch, *OutVersion->Fork, OutVersion->ForkMajor, OutVersion->ForkMinor, OutVersion->ForkPatch);
+				}
+				else
+				{
+					UE_LOG(LogSourceControl, Log, TEXT("Git version %d.%d.%d"), OutVersion->Major, OutVersion->Minor, OutVersion->Patch);
+				}
 			}
 		}
 	}
-}
-
-void FindGitCapabilities(const FString& InPathToGitBinary, FGitVersion* OutVersion)
-{
-	FString InfoMessages;
-	FString ErrorMessages;
-	RunCommandInternalRaw(TEXT("cat-file -h"), InPathToGitBinary, FString(), TArray<FString>(), TArray<FString>(), InfoMessages, ErrorMessages, 129);
-	if (InfoMessages.Contains("--filters"))
-	{
-		OutVersion->bHasCatFileWithFilters = true;
-	}
-}
-
-void FindGitLfsCapabilities(const FString& InPathToGitBinary, FGitVersion* OutVersion)
-{
-	FString InfoMessages;
-	FString ErrorMessages;
-	bool bGitLfsAvailable = RunCommandInternalRaw(TEXT("lfs version"), InPathToGitBinary, FString(), TArray<FString>(), TArray<FString>(), InfoMessages, ErrorMessages);
-	if (bGitLfsAvailable)
-	{
-		OutVersion->bHasGitLfs = true;
-
-		if (InfoMessages.Compare(TEXT("git-lfs/2.0.0")) >= 0)
-		{
-			OutVersion->bHasGitLfsLocking = true; // Git LFS File Locking workflow introduced in "git-lfs/2.0.0"
-		}
-		UE_LOG(LogSourceControl, Log, TEXT("%s"), *InfoMessages);
-	}
+#endif
 }
 
 // Find the root of the Git repository, looking from the provided path and upward in its parent directories.
@@ -481,16 +490,16 @@ void GetUserConfig(const FString& InPathToGitBinary, const FString& InRepository
 	TArray<FString> ErrorMessages;
 	TArray<FString> Parameters;
 	Parameters.Add(TEXT("user.name"));
-	bResults = RunCommandInternal(TEXT("config"), InPathToGitBinary, InRepositoryRoot, Parameters, TArray<FString>(), InfoMessages, ErrorMessages);
+	bResults = RunCommandInternal(TEXT("config"), InPathToGitBinary, InRepositoryRoot, Parameters, FGitSourceControlModule::GetEmptyStringArray(), InfoMessages, ErrorMessages);
 	if (bResults && InfoMessages.Num() > 0)
 	{
 		OutUserName = InfoMessages[0];
 	}
 
-	Parameters.Reset();
+	Parameters.Reset(1);
 	Parameters.Add(TEXT("user.email"));
 	InfoMessages.Reset();
-	bResults &= RunCommandInternal(TEXT("config"), InPathToGitBinary, InRepositoryRoot, Parameters, TArray<FString>(), InfoMessages, ErrorMessages);
+	bResults &= RunCommandInternal(TEXT("config"), InPathToGitBinary, InRepositoryRoot, Parameters, FGitSourceControlModule::GetEmptyStringArray(), InfoMessages, ErrorMessages);
 	if (bResults && InfoMessages.Num() > 0)
 	{
 		OutUserEmail = InfoMessages[0];
@@ -499,6 +508,13 @@ void GetUserConfig(const FString& InPathToGitBinary, const FString& InRepository
 
 bool GetBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName)
 {
+	const FGitSourceControlProvider& Provider = FGitSourceControlModule::Get().GetProvider();
+	if (!Provider.GetBranchName().IsEmpty())
+	{
+		OutBranchName = Provider.GetBranchName();
+		return true;
+	}
+	
 	bool bResults;
 	TArray<FString> InfoMessages;
 	TArray<FString> ErrorMessages;
@@ -506,17 +522,17 @@ bool GetBranchName(const FString& InPathToGitBinary, const FString& InRepository
 	Parameters.Add(TEXT("--short"));
 	Parameters.Add(TEXT("--quiet")); // no error message while in detached HEAD
 	Parameters.Add(TEXT("HEAD"));
-	bResults = RunCommandInternal(TEXT("symbolic-ref"), InPathToGitBinary, InRepositoryRoot, Parameters, TArray<FString>(), InfoMessages, ErrorMessages);
+	bResults = RunCommand(TEXT("symbolic-ref"), InPathToGitBinary, InRepositoryRoot, Parameters, FGitSourceControlModule::GetEmptyStringArray(), InfoMessages, ErrorMessages);
 	if (bResults && InfoMessages.Num() > 0)
 	{
 		OutBranchName = InfoMessages[0];
 	}
 	else
 	{
-		Parameters.Reset();
+		Parameters.Reset(2);
 		Parameters.Add(TEXT("-1"));
 		Parameters.Add(TEXT("--format=\"%h\"")); // no error message while in detached HEAD
-		bResults = RunCommandInternal(TEXT("log"), InPathToGitBinary, InRepositoryRoot, Parameters, TArray<FString>(), InfoMessages, ErrorMessages);
+		bResults = RunCommand(TEXT("log"), InPathToGitBinary, InRepositoryRoot, Parameters, FGitSourceControlModule::GetEmptyStringArray(), InfoMessages, ErrorMessages);
 		if (bResults && InfoMessages.Num() > 0)
 		{
 			OutBranchName = "HEAD detached at ";
@@ -531,6 +547,39 @@ bool GetBranchName(const FString& InPathToGitBinary, const FString& InRepository
 	return bResults;
 }
 
+bool GetRemoteBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName)
+{
+	const FGitSourceControlProvider& Provider = FGitSourceControlModule::Get().GetProvider();
+	if (!Provider.GetRemoteBranchName().IsEmpty())
+	{
+		OutBranchName = Provider.GetRemoteBranchName();
+		return true;
+	}
+
+	TArray<FString> InfoMessages;
+	TArray<FString> ErrorMessages;
+	TArray<FString> Parameters;
+	Parameters.Add(TEXT("--abbrev-ref"));
+	Parameters.Add(TEXT("--symbolic-full-name"));
+	Parameters.Add(TEXT("@{u}"));
+	bool bResults = RunCommand(TEXT("rev-parse"), InPathToGitBinary, InRepositoryRoot, Parameters, FGitSourceControlModule::GetEmptyStringArray(),
+								InfoMessages, ErrorMessages);
+	if (bResults && InfoMessages.Num() > 0)
+	{
+		OutBranchName = InfoMessages[0];
+	}
+	if (!bResults)
+	{
+		static bool bRunOnce = true;
+		if (bRunOnce)
+		{
+			UE_LOG(LogSourceControl, Warning, TEXT("Upstream branch not found for the current branch, skipping current branch for remote check. Please push a remote branch."));
+			bRunOnce = false;
+		}
+	}
+	return bResults;
+}
+
 bool GetCommitInfo(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutCommitId, FString& OutCommitSummary)
 {
 	bool bResults;
@@ -539,7 +588,7 @@ bool GetCommitInfo(const FString& InPathToGitBinary, const FString& InRepository
 	TArray<FString> Parameters;
 	Parameters.Add(TEXT("-1"));
 	Parameters.Add(TEXT("--format=\"%H %s\""));
-	bResults = RunCommandInternal(TEXT("log"), InPathToGitBinary, InRepositoryRoot, Parameters, TArray<FString>(), InfoMessages, ErrorMessages);
+	bResults = RunCommandInternal(TEXT("log"), InPathToGitBinary, InRepositoryRoot, Parameters, FGitSourceControlModule::GetEmptyStringArray(), InfoMessages, ErrorMessages);
 	if (bResults && InfoMessages.Num() > 0)
 	{
 		OutCommitId = InfoMessages[0].Left(40);
@@ -556,7 +605,7 @@ bool GetRemoteUrl(const FString& InPathToGitBinary, const FString& InRepositoryR
 	TArray<FString> Parameters;
 	Parameters.Add(TEXT("get-url"));
 	Parameters.Add(TEXT("origin"));
-	const bool bResults = RunCommandInternal(TEXT("remote"), InPathToGitBinary, InRepositoryRoot, Parameters, TArray<FString>(), InfoMessages, ErrorMessages);
+	const bool bResults = RunCommandInternal(TEXT("remote"), InPathToGitBinary, InRepositoryRoot, Parameters, FGitSourceControlModule::GetEmptyStringArray(), InfoMessages, ErrorMessages);
 	if (bResults && InfoMessages.Num() > 0)
 	{
 		OutRemoteUrl = InfoMessages[0];
@@ -667,9 +716,10 @@ bool RunCommit(const FString& InPathToGitBinary, const FString& InRepositoryRoot
 /**
  * Parse informations on a file locked with Git LFS
  *
- * Example output of "git lfs locks"
+ * Examples output of "git lfs locks":
 Content\ThirdPersonBP\Blueprints\ThirdPersonCharacter.uasset    SRombauts       ID:891
-Content\ThirdPersonBP\Blueprints\ThirdPersonGameMode.uasset     SRombauts       ID:896
+Content\ThirdPersonBP\Blueprints\ThirdPersonCharacter.uasset                    ID:891
+Content\ThirdPersonBP\Blueprints\ThirdPersonCharacter.uasset    ID:891
  */
 class FGitLfsLocksParser
 {
@@ -678,7 +728,8 @@ public:
 	{
 		TArray<FString> Informations;
 		InStatus.ParseIntoArray(Informations, TEXT("\t"), true);
-		if (Informations.Num() >= 3)
+		
+		if (Informations.Num() >= 2)
 		{
 			Informations[0].TrimEndInline(); // Trim whitespace from the end of the filename
 			Informations[1].TrimEndInline(); // Trim whitespace from the end of the username
@@ -686,12 +737,23 @@ public:
 				LocalFilename = FPaths::ConvertRelativePathToFull(InRepositoryRoot, Informations[0]);
 			else
 				LocalFilename = Informations[0];
-			LockUser = MoveTemp(Informations[1]);
+			// Filename ID (or we expect it to be the username, but it's empty, or is the ID, we have to assume it's the current user)
+			if (Informations.Num() == 2 || Informations[1].IsEmpty() || Informations[1].StartsWith(TEXT("ID:")))
+			{
+				LockUser = FGitSourceControlModule::Get().GetProvider().GetLockUser();
+			}
+			// Filename Username ID
+			else
+			{
+				LockUser = MoveTemp(Informations[1]);
+			}
 		}
 	}
 
-	FString LocalFilename; ///< Filename on disk
-	FString LockUser; ///< Name of user who has file locked
+	// Filename on disk
+	FString LocalFilename;
+	// Name of user who has file locked
+	FString LockUser;
 };
 
 /**
@@ -763,48 +825,63 @@ public:
 		{
 			// "Unmerged" conflict cases are generally marked with a "U",
 			// but there are also the special cases of both "A"dded, or both "D"eleted
-			State = EWorkingCopyState::Conflicted;
+			FileState = EFileState::Unmerged;
+			TreeState = ETreeState::Working;
+			return;
 		}
-		else if (IndexState == 'A')
+
+		if (IndexState == ' ')
 		{
-			State = EWorkingCopyState::Added;
+			TreeState = ETreeState::Working;
 		}
-		else if (IndexState == 'D')
+		else if (WCopyState == ' ')
 		{
-			State = EWorkingCopyState::Deleted;
+			TreeState = ETreeState::Staged;
 		}
-		else if (WCopyState == 'D')
+
+		if (IndexState == '?' || WCopyState == '?')
 		{
-			State = EWorkingCopyState::Missing;
-		}
-		else if (IndexState == 'M' || WCopyState == 'M')
-		{
-			State = EWorkingCopyState::Modified;
-		}
-		else if (IndexState == 'R')
-		{
-			State = EWorkingCopyState::Renamed;
-		}
-		else if (IndexState == 'C')
-		{
-			State = EWorkingCopyState::Copied;
-		}
-		else if (IndexState == '?' || WCopyState == '?')
-		{
-			State = EWorkingCopyState::NotControlled;
+			TreeState = ETreeState::Untracked;
+			FileState = EFileState::Unknown;
 		}
 		else if (IndexState == '!' || WCopyState == '!')
 		{
-			State = EWorkingCopyState::Ignored;
+			TreeState = ETreeState::Ignored;
+			FileState = EFileState::Unknown;
+		}
+		else if (IndexState == 'A')
+		{
+			FileState = EFileState::Added;
+		}
+		else if (IndexState == 'D')
+		{
+			FileState = EFileState::Deleted;
+		}
+		else if (WCopyState == 'D')
+		{
+			FileState = EFileState::Missing;
+		}
+		else if (IndexState == 'M' || WCopyState == 'M')
+		{
+			FileState = EFileState::Modified;
+		}
+		else if (IndexState == 'R')
+		{
+			FileState = EFileState::Renamed;
+		}
+		else if (IndexState == 'C')
+		{
+			FileState = EFileState::Copied;
 		}
 		else
 		{
 			// Unmodified never yield a status
-			State = EWorkingCopyState::Unknown;
+			FileState = EFileState::Unknown;
 		}
 	}
 
-	EWorkingCopyState::Type State;
+	EFileState::Type FileState;
+	ETreeState::Type TreeState;
 };
 
 /**
@@ -850,6 +927,66 @@ static void RunGetConflictStatus(const FString& InPathToGitBinary, const FString
 	}
 }
 
+TArray<UPackage*> UnlinkPackages(const TArray<FString>& InPackageNames)
+{
+	TArray<UPackage*> LoadedPackages;
+	// UE4-COPY: ContentBrowserUtils::SyncPathsFromSourceControl()
+	if (InPackageNames.Num() > 0)
+	{
+		TArray<FString> PackagesToUnlink;
+		for (const auto& Filename : InPackageNames)
+		{
+			FString PackageName;
+			if (FPackageName::TryConvertFilenameToLongPackageName(Filename, PackageName))
+			{
+				PackagesToUnlink.Add(*PackageName);
+			}
+		}
+		// Form a list of loaded packages to reload...
+		LoadedPackages.Reserve(PackagesToUnlink.Num());
+		for (const FString& PackageName : PackagesToUnlink)
+		{
+			UPackage* Package = FindPackage(nullptr, *PackageName);
+			if (Package)
+			{
+				LoadedPackages.Emplace(Package);
+
+				// Detach the linkers of any loaded packages so that SCC can overwrite the files...
+				if (!Package->IsFullyLoaded())
+				{
+					FlushAsyncLoading();
+					Package->FullyLoad();
+				}
+				ResetLoaders(Package);
+			}
+		}
+	}
+	return LoadedPackages;
+}
+
+void ReloadPackages(TArray<UPackage*>& InPackagesToReload)
+{
+	// UE4-COPY: ContentBrowserUtils::SyncPathsFromSourceControl()
+	// Syncing may have deleted some packages, so we need to unload those rather than re-load them...
+	TArray<UPackage*> PackagesToUnload;
+	InPackagesToReload.RemoveAll([&](UPackage* InPackage) -> bool {
+		const FString PackageExtension = InPackage->ContainsMap() ? FPackageName::GetMapPackageExtension() : FPackageName::GetAssetPackageExtension();
+		const FString PackageFilename = FPackageName::LongPackageNameToFilename(InPackage->GetName(), PackageExtension);
+		if (!FPaths::FileExists(PackageFilename))
+		{
+			PackagesToUnload.Emplace(InPackage);
+			return true; // remove package
+		}
+		return false; // keep package
+	});
+
+	// Hot-reload the new packages...
+	UPackageTools::ReloadPackages(InPackagesToReload);
+
+	// Unload any deleted packages...
+	UPackageTools::UnloadPackages(PackagesToUnload);
+}
+
 /// Convert filename relative to the repository root to absolute path (inplace)
 void AbsoluteFilenames(const FString& InRepositoryRoot, TArray<FString>& InFileNames)
 {
@@ -863,14 +1000,41 @@ void AbsoluteFilenames(const FString& InRepositoryRoot, TArray<FString>& InFileN
  *
  * Called in case of a "directory status" (no file listed in the command) when using the "Submit to Source Control" menu.
  */
-static bool ListFilesInDirectoryRecurse(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InDirectory, TArray<FString>& OutFiles)
+bool ListFilesInDirectoryRecurse(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InDirectory, TArray<FString>& OutFiles)
 {
 	TArray<FString> ErrorMessages;
 	TArray<FString> Directory;
 	Directory.Add(InDirectory);
-	const bool bResult = RunCommandInternal(TEXT("ls-files"), InPathToGitBinary, InRepositoryRoot, TArray<FString>(), Directory, OutFiles, ErrorMessages);
+	const bool bResult = RunCommandInternal(TEXT("ls-files"), InPathToGitBinary, InRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), Directory, OutFiles, ErrorMessages);
 	AbsoluteFilenames(InRepositoryRoot, OutFiles);
 	return bResult;
+}
+
+/** Parse the array of strings results of a 'git status' command for a directory
+ *
+ *  Called in case of a "directory status" (no file listed in the command) ONLY to detect Deleted/Missing/Untracked files
+ * since those files are not listed by the 'git ls-files' command.
+ *
+ * @see #ParseFileStatusResult() above for an example of a 'git status' results
+ */
+static void ParseDirectoryStatusResult(const bool InUsingLfsLocking, const TMap<FString, FString>& InResults, TMap<FString, FGitSourceControlState>& OutStates)
+{
+	// Iterate on each line of result of the status command
+	for (const auto& Result : InResults)
+	{
+		FGitSourceControlState FileState(Result.Key);
+		if (!InUsingLfsLocking)
+		{
+			FileState.State.LockState = ELockState::Unlockable;
+		}
+		FGitStatusParser StatusParser(Result.Value);
+		if ((EFileState::Deleted == StatusParser.FileState) || (EFileState::Missing == StatusParser.FileState) || (ETreeState::Untracked == StatusParser.TreeState))
+		{
+			FileState.State.FileState = StatusParser.FileState;
+			FileState.State.TreeState = StatusParser.TreeState;
+			OutStates.Add(Result.Key, MoveTemp(FileState));
+		}
+	}
 }
 
 /** Parse the array of strings results of a 'git status' command for a provided list of files all in a common directory
@@ -883,28 +1047,37 @@ R  Content/Textures/T_Perlin_Noise_M.uasset -> Content/Textures/T_Perlin_Noise_M
 ?? Content/Materials/M_Basic_Wall.uasset
 !! BasicCode.sln
 */
-static void ParseFileStatusResult(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles,
-								  const TMap<FString, FString>& InLockedFiles, const TArray<FString>& InResults, TArray<FGitSourceControlState>& OutStates)
+static void ParseFileStatusResult(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TSet<FString>& InFiles,
+								  const TMap<FString, FString>& InResults, TMap<FString, FGitSourceControlState>& OutStates)
 {
-	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
-	const FString LfsUserName = GitSourceControl.AccessSettings().GetLfsUserName();
-	const FDateTime Now = FDateTime::Now();
+	FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
+	const FString& LfsUserName = GitSourceControl.GetProvider().GetLockUser();
+
+	TMap<FString, FString> LockedFiles;
+	TMap<FString, FString> Results = InResults;
+	bool bCheckedLockedFiles = false;
+
+	FString Result;
 
 	// Iterate on all files explicitly listed in the command
 	for (const auto& File : InFiles)
 	{
-		FGitSourceControlState FileState(File, InUsingLfsLocking);
+		FGitSourceControlState FileState(File);
+		FileState.State.FileState = EFileState::Unset;
+		FileState.State.TreeState = ETreeState::Unset;
+		FileState.State.LockState = ELockState::Unset;
 		// Search the file in the list of status
-		int32 IdxResult = InResults.IndexOfByPredicate(FGitStatusFileMatcher(File));
-		if (IdxResult != INDEX_NONE)
+		bool bFound = Results.RemoveAndCopyValue(File, Result);
+		if (bFound)
 		{
 			// File found in status results; only the case for "changed" files
-			FGitStatusParser StatusParser(InResults[IdxResult]);
-#if UE_BUILD_DEBUG
-			UE_LOG(LogSourceControl, Log, TEXT("Status(%s) = '%s' => %d"), *File, *InResults[IdxResult], static_cast<int>(StatusParser.State));
+			FGitStatusParser StatusParser(Result);
+#if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
+			UE_LOG(LogSourceControl, Log, TEXT("Status(%s) = '%s' => File:%d, Tree:%d"), *File, *Result, static_cast<int>(StatusParser.FileState), static_cast<int>(StatusParser.TreeState));
 #endif
 
-			FileState.WorkingCopyState = StatusParser.State;
+			FileState.State.FileState = StatusParser.FileState;
+			FileState.State.TreeState = StatusParser.TreeState;
 			if (FileState.IsConflicted())
 			{
 				// In case of a conflict (unmerged file) get the base revision to merge
@@ -913,81 +1086,80 @@ static void ParseFileStatusResult(const FString& InPathToGitBinary, const FStrin
 		}
 		else
 		{
+			FileState.State.FileState = EFileState::Unknown;
 			// File not found in status
 			if (FPaths::FileExists(File))
 			{
 				// usually means the file is unchanged,
-				FileState.WorkingCopyState = EWorkingCopyState::Unchanged;
-#if UE_BUILD_DEBUG
+				FileState.State.TreeState = ETreeState::Unmodified;
+#if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
 				UE_LOG(LogSourceControl, Log, TEXT("Status(%s) not found but exists => unchanged"), *File);
 #endif
 			}
 			else
 			{
 				// but also the case for newly created content: there is no file on disk until the content is saved for the first time
-				FileState.WorkingCopyState = EWorkingCopyState::NotControlled;
-#if UE_BUILD_DEBUG
+				FileState.State.TreeState = ETreeState::NotInRepo;
+#if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
 				UE_LOG(LogSourceControl, Log, TEXT("Status(%s) not found and does not exists => new/not controled"), *File);
 #endif
 			}
 		}
-		if (InLockedFiles.Contains(File))
+		if (!InUsingLfsLocking)
 		{
-			FileState.LockUser = InLockedFiles[File];
-			if (LfsUserName == FileState.LockUser)
-			{
-				FileState.LockState = ELockState::Locked;
-			}
-			else
-			{
-				FileState.LockState = ELockState::LockedOther;
-			}
-#if UE_BUILD_DEBUG
-			UE_LOG(LogSourceControl, Log, TEXT("Status(%s) Locked by '%s'"), *File, *FileState.LockUser);
-#endif
+			FileState.State.LockState = ELockState::Unlockable;
 		}
 		else
 		{
-			FileState.LockState = ELockState::NotLocked;
-#if UE_BUILD_DEBUG
-			if (InUsingLfsLocking)
+			if (IsFileLFSLockable(File))
 			{
-				UE_LOG(LogSourceControl, Log, TEXT("Status(%s) Not Locked"), *File);
+				if (!bCheckedLockedFiles)
+				{
+					bCheckedLockedFiles = true;
+					TArray<FString> ErrorMessages;
+					GetAllLocks(InRepositoryRoot, ErrorMessages, LockedFiles);
+					FMessageLog SourceControlLog("SourceControl");
+					for (int32 ErrorIndex = 0; ErrorIndex < ErrorMessages.Num(); ++ErrorIndex)
+					{
+						SourceControlLog.Error(FText::FromString(ErrorMessages[ErrorIndex]));
+					}
+				}
+				if (LockedFiles.Contains(File))
+				{
+					FileState.State.LockUser = LockedFiles[File];
+					if (LfsUserName == FileState.State.LockUser)
+					{
+						FileState.State.LockState = ELockState::Locked;
+					}
+					else
+					{
+						FileState.State.LockState = ELockState::LockedOther;
+					}
+				}
+				else
+				{
+					FileState.State.LockState = ELockState::NotLocked;
+#if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
+					UE_LOG(LogSourceControl, Log, TEXT("Status(%s) Not Locked"), *File);
+#endif
+				}
 			}
+			else
+			{
+				FileState.State.LockState = ELockState::Unlockable;
+			}
+			
+			
+#if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
+			UE_LOG(LogSourceControl, Log, TEXT("Status(%s) Locked by '%s'"), *File, *FileState.State.LockUser);
 #endif
 		}
-		FileState.TimeStamp = Now;
-		OutStates.Add(FileState);
+		OutStates.Add(File, MoveTemp(FileState));
 	}
-}
 
-/** Parse the array of strings results of a 'git status' command for a directory
- *
- *  Called in case of a "directory status" (no file listed in the command) ONLY to detect Deleted/Missing/Untracked files
- * since those files are not listed by the 'git ls-files' command.
- *
- * @see #ParseFileStatusResult() above for an example of a 'git status' results
- */
-static void ParseDirectoryStatusResult(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking,
-									   const TArray<FString>& InResults, TArray<FGitSourceControlState>& OutStates)
-{
-	const FDateTime Now = FDateTime::Now();
-	// Iterate on each line of result of the status command
-	for (const FString& Result : InResults)
-	{
-		const FString RelativeFilename = FilenameFromGitStatus(Result);
-		const FString File = FPaths::ConvertRelativePathToFull(InRepositoryRoot, RelativeFilename);
-
-		FGitSourceControlState FileState(File, InUsingLfsLocking);
-		FGitStatusParser StatusParser(Result);
-		if ((EWorkingCopyState::Deleted == StatusParser.State) || (EWorkingCopyState::Missing == StatusParser.State) ||
-			(EWorkingCopyState::NotControlled == StatusParser.State))
-		{
-			FileState.WorkingCopyState = StatusParser.State;
-			FileState.TimeStamp = Now;
-			OutStates.Add(MoveTemp(FileState));
-		}
-	}
+	// The above cannot detect deleted assets since there is no file left to enumerate (either by the Content Browser or by git ls-files)
+	// => so we also parse the status results to explicitly look for Deleted/Missing assets
+	ParseDirectoryStatusResult(InUsingLfsLocking, Results, OutStates);
 }
 
 /**
@@ -1004,240 +1176,261 @@ static void ParseDirectoryStatusResult(const FString& InPathToGitBinary, const F
  * @param[out]	OutStates			States of files for witch the status has been gathered (distinct than InFiles in case of a "directory status")
  */
 static void ParseStatusResults(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles,
-							   const TMap<FString, FString>& InLockedFiles, const TArray<FString>& InResults, TArray<FGitSourceControlState>& OutStates)
+							   const TMap<FString, FString>& InResults, TMap<FString, FGitSourceControlState>& OutStates)
 {
-	if ((InFiles.Num() == 1) && FPaths::DirectoryExists(InFiles[0]))
+	TSet<FString> Files;
+	for (const auto& File : InFiles)
 	{
-		// 1) Special case for "status" of a directory: requires to get the list of files by ourselves.
-		//   (this is triggered by the "Submit to Source Control" menu)
-#if UE_BUILD_DEBUG
-		UE_LOG(LogSourceControl, Log, TEXT("ParseStatusResults: 1) Special case for status of a directory (%s)"), *InFiles[0]);
-#endif
-		TArray<FString> Files;
-		const FString& Directory = InFiles[0];
-		const bool bResult = ListFilesInDirectoryRecurse(InPathToGitBinary, InRepositoryRoot, Directory, Files);
-		if (bResult)
+		if (FPaths::DirectoryExists(File))
 		{
-			ParseFileStatusResult(InPathToGitBinary, InRepositoryRoot, InUsingLfsLocking, Files, InLockedFiles, InResults, OutStates);
-		}
-		// The above cannot detect deleted assets since there is no file left to enumerate (either by the Content Browser or by git ls-files)
-		// => so we also parse the status results to explicitly look for Deleted/Missing assets
-		ParseDirectoryStatusResult(InPathToGitBinary, InRepositoryRoot, InUsingLfsLocking, InResults, OutStates);
-	}
-	else
-	{
-		// 2) General case for one or more files in the same directory.
-#if UE_BUILD_DEBUG
-		UE_LOG(LogSourceControl, Log, TEXT("ParseStatusResults: 2) General case for one or more files (%s, ...)"), *InFiles[0]);
-#endif
-		ParseFileStatusResult(InPathToGitBinary, InRepositoryRoot, InUsingLfsLocking, InFiles, InLockedFiles, InResults, OutStates);
-	}
-}
-
-void CheckRemote(const FString& CurrentBranchName, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& OnePath,
-				 TArray<FString>& OutErrorMessages, TArray<FGitSourceControlState>& OutStates)
-{
-	// Using git diff, we can obtain a list of files that were modified between our current origin and HEAD. Assumes that fetch has been run to get accurate info.
-	// TODO: should do a fetch (at least periodically).
-
-	TArray<FString> EmptyFilesList;
-
-	// Gather valid remote branches
-	TArray<FString> Results;
-	TArray<FString> ErrorMessages;
-	TSet<FString> Branches;
-	TArray<FString> ParametersLsRemote;
-	ParametersLsRemote.Add(TEXT("origin"));
-
-	// TODO: make branch names configurable
-	Branches.Add(TEXT("trunk"));
-	Branches.Add(CurrentBranchName);
-
-	for (auto& Branch : Branches)
-	{
-		ParametersLsRemote.Add(Branch);
-	}
-
-	TSet<FString> BranchesToDiff;
-	const bool bResultLsRemote = RunCommand(TEXT("ls-remote"), InPathToGitBinary, InRepositoryRoot, ParametersLsRemote, EmptyFilesList, Results, ErrorMessages);
-
-	for (auto& Branch : Branches)
-	{
-		for (auto& Result : Results)
-		{
-			if (Result.Contains(Branch))
+			TArray<FString> DirectoryFiles;
+			const bool bResult = ListFilesInDirectoryRecurse(InPathToGitBinary, InRepositoryRoot, File, DirectoryFiles);
+			if (bResult)
 			{
-				BranchesToDiff.Add(Branch);
+				for (const auto& InnerFile : DirectoryFiles)
+				{
+					Files.Add(InnerFile);
+				}
 			}
-		}
-	}
-
-	Results.Reset();
-
-	const bool bDiffAgainstRemoteCurrent = BranchesToDiff.Contains(CurrentBranchName);
-	if (!bDiffAgainstRemoteCurrent)
-	{
-		// still add to check as a local
-		BranchesToDiff.Add(CurrentBranchName);
-	}
-	TArray<FString> ParametersDiff;
-	for (auto& Branch : BranchesToDiff)
-	{
-		ParametersDiff.Add(TEXT("--name-only"));
-		if (Branch.Equals(CurrentBranchName))
-		{
-			ParametersDiff.Add(bDiffAgainstRemoteCurrent ? FString::Printf(TEXT("HEAD...origin/%s "), *Branch) : FString::Printf(TEXT("HEAD...%s"), *Branch));
 		}
 		else
 		{
-			ParametersDiff.Add(FString::Printf(TEXT("HEAD...origin/%s"), *Branch));
+			Files.Add(File);
 		}
-		const bool bResultDiff = RunCommand(TEXT("diff"), InPathToGitBinary, InRepositoryRoot, ParametersDiff, OnePath, Results, ErrorMessages);
+	}
+	ParseFileStatusResult(InPathToGitBinary, InRepositoryRoot, InUsingLfsLocking, Files, InResults, OutStates);
+}
+
+void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& Files,
+				 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlState>& OutStates)
+{
+	// We can obtain a list of files that were modified between our remote branches and HEAD. Assumes that fetch has been run to get accurate info.
+
+	// Gather valid remote branches
+	TArray<FString> ErrorMessages;
+
+	TSet<FString> BranchesToDiff{ FGitSourceControlModule::Get().GetProvider().GetStatusBranchNames() };
+
+	bool bDiffAgainstRemoteCurrent = false;
+
+	// Get the current branch's remote.
+	FString CurrentBranchName;
+	if (GetRemoteBranchName(InPathToGitBinary, InRepositoryRoot, CurrentBranchName))
+	{
+		// We have a valid remote, so diff against it.
+		bDiffAgainstRemoteCurrent = true;
+		// Ensure that the remote branch is in there.
+		BranchesToDiff.Add(CurrentBranchName);
+	}
+
+	if (!BranchesToDiff.Num())
+	{
+		return;
+	}
+
+	TArray<FString> Results;
+	TMap<FString, FString> NewerFiles;
+
+	const TArray<FString>& RelativeFiles = RelativeFilenames(Files, InRepositoryRoot);
+	// Get the full remote status of the Content folder, since it's the only lockable folder we track in editor. 
+	// This shows any new files as well.
+	// Also update the status of `.checksum`.
+	TArray<FString> FilesToDiff{FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()), ".checksum"};
+
+	TArray<FString> ParametersLog{TEXT("--pretty="), TEXT("--name-only"), TEXT(""), TEXT("--")};
+	for (auto& Branch : BranchesToDiff)
+	{
+		bool bCurrentBranch;
+		if (bDiffAgainstRemoteCurrent && Branch.Equals(CurrentBranchName))
+		{
+			bCurrentBranch = true;
+		}
+		else
+		{
+			bCurrentBranch = false;
+		}
+		// empty defaults to HEAD
+		// .. means commits in the right that are not in the left
+		ParametersLog[2] = FString::Printf(TEXT("..%s"), *Branch);
+
+		const bool bResultDiff = RunCommand(TEXT("log"), InPathToGitBinary, InRepositoryRoot, ParametersLog, FilesToDiff, Results, ErrorMessages);
 		if (bResultDiff)
 		{
 			for (const FString& NewerFileName : Results)
 			{
-				const FString NewerFilePath = FPaths::ConvertRelativePathToFull(InRepositoryRoot, NewerFileName);
-
-				// Find existing corresponding file state to update it (not found would mean new file or not in the current path)
-				if (FGitSourceControlState* FileStatePtr =
-						OutStates.FindByPredicate([NewerFilePath](FGitSourceControlState& FileState) { return FileState.LocalFilename == NewerFilePath; }))
+				// Don't care about mergeable files (.collection, .ini, .uproject, etc)
+				if (!IsFileLFSLockable(NewerFileName))
 				{
-					FileStatePtr->bNewerVersionOnServer = true;
+					// Check if there's newer binaries pending on this branch
+					if (bCurrentBranch && NewerFileName == TEXT(".checksum"))
+					{
+						FGitSourceControlModule::Get().GetProvider().bPendingRestart = true;
+					}
+					continue;
+				}
+				const FString& NewerFilePath = FPaths::ConvertRelativePathToFull(InRepositoryRoot, NewerFileName);
+				if (bCurrentBranch || !NewerFiles.Contains(NewerFilePath))
+				{
+					NewerFiles.Add(NewerFilePath, Branch);
 				}
 			}
 		}
-		ParametersDiff.Reset();
+		Results.Reset();
+	}
+
+	for (const auto& NewFile : NewerFiles)
+	{
+		if (FGitSourceControlState* FileState = OutStates.Find(NewFile.Key))
+		{
+			FileState->State.RemoteState = NewFile.Value.Equals(CurrentBranchName) ? ERemoteState::NotAtHead : ERemoteState::NotLatest;
+			FileState->State.HeadBranch = NewFile.Value;
+		}
 	}
 
 	OutErrorMessages.Append(ErrorMessages);
 }
 
-bool GetAllLocks(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool bAbsolutePaths, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache)
+const FTimespan CacheLimit = FTimespan::FromSeconds(30);
+
+bool GetAllLocks(const FString& InRepositoryRoot, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache)
 {
-	const FDateTime CurrentTime = FDateTime::UtcNow();
-	FTimespan CacheTimeElapsed = CurrentTime - FGitLockedFilesCache::LastUpdated;
-	FTimespan CacheLimit = FTimespan::FromMinutes(3);
-	bool bCacheExpired = (FGitLockedFilesCache::LockedFiles.Num() < 1) || CacheTimeElapsed > CacheLimit;
-	bool bResult;
-	if (bInvalidateCache || bCacheExpired)
+	// You may ask, why are we ignoring state cache, and instead maintaining our own lock cache?
+	// The answer is that state cache updating is another operation, and those that update status
+	// (and thus the state cache) are using GetAllLocks. However, querying remote locks are almost always
+	// irrelevant in most of those update status cases. So, we need to provide a fast way to provide
+	// an updated local lock state. We could do this through the relevant lfs lock command arguments, which
+	// as you will see below, we use only for offline cases, but the exec cost of doing this isn't worth it
+	// when we can easily maintain this cache here. So, we are really emulating an internal Git LFS locks cache
+	// call, which gets fed into the state cache, rather than reimplementing the state cache :)
+	const FDateTime CurrentTime = FDateTime::Now();
+	bool bCacheExpired = bInvalidateCache;
+	if (!bInvalidateCache)
 	{
-		TArray<FString> Results;
-		TArray<FString> ErrorMessages;
-		bResult = RunCommand(TEXT("lfs locks"), InPathToGitBinary, InRepositoryRoot, TArray<FString>(), TArray<FString>(), Results, ErrorMessages);
-		for (const FString& Result : Results)
-		{
-			FGitLfsLocksParser LockFile(InRepositoryRoot, Result, bAbsolutePaths);
-#if UE_BUILD_DEBUG
-			UE_LOG(LogSourceControl, Log, TEXT("LockedFile(%s, %s)"), *LockFile.LocalFilename, *LockFile.LockUser);
-#endif
-			OutLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
-		}
-
-		FGitLockedFilesCache::LockedFiles = OutLocks;
-		FGitLockedFilesCache::LastUpdated = FDateTime::UtcNow();
+		const FTimespan CacheTimeElapsed = CurrentTime - FGitLockedFilesCache::LastUpdated;
+		bCacheExpired = CacheTimeElapsed > CacheLimit;
 	}
-	else
+	bool bResult;
+	if (bCacheExpired)
 	{
-		OutLocks = FGitLockedFilesCache::LockedFiles;
-
+		// Our cache expired, or they asked us to expire cache. Query locks directly from the remote server.
+		TArray<FString> ErrorMessages;
+		TArray<FString> Results;
+		bResult = RunLFSCommand(TEXT("locks"), InRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(), FGitSourceControlModule::GetEmptyStringArray(),
+								Results, OutErrorMessages);
+		if (bResult)
+		{
+			for (const FString& Result : Results)
+			{
+				FGitLfsLocksParser LockFile(InRepositoryRoot, Result);
+#if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
+				UE_LOG(LogSourceControl, Log, TEXT("LockedFile(%s, %s)"), *LockFile.LocalFilename, *LockFile.LockUser);
+#endif
+				OutLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
+			}
+			FGitLockedFilesCache::LastUpdated = CurrentTime;
+			FGitLockedFilesCache::LockedFiles = OutLocks;
+			return bResult;
+		}
+		// We tried to invalidate the UE4 cache, but we failed for some reason. Try updating lock state from LFS cache.
+		// Get the last known state of remote locks
 		TArray<FString> Params;
 		Params.Add(TEXT("--cached"));
 
-		TArray<FString> Results;
-		TArray<FString> ErrorMessages;
-		bResult = RunCommand(TEXT("lfs locks"), InPathToGitBinary, InRepositoryRoot, Params, TArray<FString>(), Results, ErrorMessages);
+		const FString& LockUser = FGitSourceControlModule::Get().GetProvider().GetLockUser();
+
+		Results.Reset();
+		bResult = RunLFSCommand(TEXT("locks"), InRepositoryRoot, Params, FGitSourceControlModule::GetEmptyStringArray(), Results, OutErrorMessages);
 		for (const FString& Result : Results)
 		{
 			FGitLfsLocksParser LockFile(InRepositoryRoot, Result);
-#if UE_BUILD_DEBUG
+#if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
 			UE_LOG(LogSourceControl, Log, TEXT("LockedFile(%s, %s)"), *LockFile.LocalFilename, *LockFile.LockUser);
 #endif
-			OutLocks.FindOrAdd(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
+			// Only update remote locks
+			if (LockFile.LockUser != LockUser)
+			{
+				OutLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
+			}
 		}
+		// Get the latest local state of our own locks
+		Params.Reset(1);
+		Params.Add(TEXT("--local"));
 
-		FGitLockedFilesCache::LockedFiles = OutLocks;
+		Results.Reset();
+		bResult &= RunLFSCommand(TEXT("locks"), InRepositoryRoot, Params, FGitSourceControlModule::GetEmptyStringArray(), Results, OutErrorMessages);
+		for (const FString& Result : Results)
+		{
+			FGitLfsLocksParser LockFile(InRepositoryRoot, Result);
+#if UE_BUILD_DEBUG && GIT_DEBUG_STATUS
+			UE_LOG(LogSourceControl, Log, TEXT("LockedFile(%s, %s)"), *LockFile.LocalFilename, *LockFile.LockUser);
+#endif
+			// Only update local locks
+			if (LockFile.LockUser == LockUser)
+			{
+				OutLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
+			}
+		}
+	}
+	else
+	{
+		// We can use our internally tracked local lock cache (an effective combination of --cached and --local)
+		OutLocks = FGitLockedFilesCache::LockedFiles;
+		bResult = true;
 	}
 	return bResult;
 }
 
-// Run a batch of Git "status" command to update status of given files and/or directories.
-bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles, TArray<FString>& OutErrorMessages, TArray<FGitSourceControlState>& OutStates, bool bInvalidateCache)
+void GetLockedFiles(const TArray<FString>& InFiles, TArray<FString>& OutFiles)
 {
-	bool bResults = true;
-	TMap<FString, FString> LockedFiles;
+	FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
+	FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
 
+	TArray<TSharedRef<ISourceControlState, ESPMode::ThreadSafe>> LocalStates;
+	Provider.GetState(InFiles, LocalStates, EStateCacheUsage::Use);
+	for (const auto& State : LocalStates)
+	{
+		const auto& GitState = StaticCastSharedRef<FGitSourceControlState>(State);
+		if (GitState->State.LockState == ELockState::Locked)
+		{
+			OutFiles.Add(GitState->GetFilename());
+		}
+	}
+}
+
+// Run a batch of Git "status" command to update status of given files and/or directories.
+bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles,
+					 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlState>& OutStates)
+{
 	// Remove files that aren't in the repository
-	TArray<FString> RepoFiles = InFiles.FilterByPredicate([InRepositoryRoot](const FString& elt) {return elt.StartsWith(InRepositoryRoot); });
+	const TArray<FString>& RepoFiles = InFiles.FilterByPredicate([InRepositoryRoot](const FString& File) { return File.StartsWith(InRepositoryRoot); });
 
-	// 0) Issue a "git lfs locks" command at the root of the repository
-	if (InUsingLfsLocking)
+	if (!RepoFiles.Num())
 	{
-		TArray<FString> ErrorMessages;
-		GetAllLocks(InPathToGitBinary, InRepositoryRoot, true, ErrorMessages, LockedFiles);
+		return false;
 	}
-
-	// Git status does not show any "untracked files" when called with files from different subdirectories! (issue #3)
-	// 1) So here we group files by path (ie. by subdirectory)
-	TMap<FString, TArray<FString>> GroupOfFiles;
-	for(const auto& File : RepoFiles)
-	{
-		const FString Path = FPaths::GetPath(*File);
-		TArray<FString>* Group = GroupOfFiles.Find(Path);
-		if (Group != nullptr)
-		{
-			Group->Add(File);
-		}
-		else
-		{
-			TArray<FString> NewGroup;
-			NewGroup.Add(File);
-			GroupOfFiles.Add(Path, NewGroup);
-		}
-	}
-
-	// Get the current branch name, since we need origin of current branch
-	FString BranchName;
-	GitSourceControlUtils::GetBranchName(InPathToGitBinary, InRepositoryRoot, BranchName);
 
 	TArray<FString> Parameters;
 	Parameters.Add(TEXT("--porcelain"));
-	Parameters.Add(TEXT("--ignored"));
-
-	// 2) then we can batch git status operation by subdirectory
-	for (const auto& Files : GroupOfFiles)
+	Parameters.Add(TEXT("-unormal")); // make sure we use -unormal (user can customize it)
+	// We skip checking ignored since no one ignores files that Unreal would read in as source controlled (Content/{*.uasset,*.umap},Config/*.ini).
+	TArray<FString> Results;
+	// avoid locking the index when not needed (useful for status updates)
+	const bool bResult = RunCommand(TEXT("--no-optional-locks status"), InPathToGitBinary, InRepositoryRoot, Parameters, RepoFiles, Results, OutErrorMessages);
+	TMap<FString, FString> ResultsMap;
+	for (const auto& Result : Results)
 	{
-		// "git status" can only detect renamed and deleted files when it operate on a folder, so use one folder path for all files in a directory
-		const FString Path = FPaths::GetPath(*Files.Value[0]);
-		TArray<FString> OnePath;
-		// Only one file: optim very useful for the .uproject file at the root to avoid parsing the whole repository
-		// (works only if the file exists)
-		if ((Files.Value.Num() == 1) && (FPaths::FileExists(Files.Value[0])))
-		{
-			OnePath.Add(Files.Value[0]);
-		}
-		else
-		{
-			OnePath.Add(Path);
-		}
-		{
-			TArray<FString> Results;
-			TArray<FString> ErrorMessages;
-			const bool bResult = RunCommand(TEXT("status"), InPathToGitBinary, InRepositoryRoot, Parameters, OnePath, Results, ErrorMessages);
-			OutErrorMessages.Append(ErrorMessages);
-			if(bResult)
-			{
-				ParseStatusResults(InPathToGitBinary, InRepositoryRoot, InUsingLfsLocking, Files.Value, LockedFiles, Results, OutStates);
-			}
-		}
+		const FString& RelativeFilename = FilenameFromGitStatus(Result);
+		const FString& File = FPaths::ConvertRelativePathToFull(InRepositoryRoot, RelativeFilename);
+		ResultsMap.Add(File, Result);
+	}
+	if (bResult)
+	{
+		ParseStatusResults(InPathToGitBinary, InRepositoryRoot, InUsingLfsLocking, RepoFiles, ResultsMap, OutStates);
 	}
 
-	if (!BranchName.IsEmpty())
-	{
-		CheckRemote(BranchName, InPathToGitBinary, InRepositoryRoot, RepoFiles, OutErrorMessages, OutStates);
-	}
+	CheckRemote(InPathToGitBinary, InRepositoryRoot, RepoFiles, OutErrorMessages, OutStates);
 
-	return bResults;
+	return bResult;
 }
 
 // Run a Git `cat-file --filters` command to dump the binary content of a revision into a file.
@@ -1246,8 +1439,7 @@ bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepository
 	int32 ReturnCode = -1;
 	FString FullCommand;
 
-	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
-	const FGitVersion& GitVersion = GitSourceControl.GetProvider().GetGitVersion();
+	FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
 
 	if (!InRepositoryRoot.IsEmpty())
 	{
@@ -1258,16 +1450,8 @@ bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepository
 	}
 
 	// then the git command itself
-	if (GitVersion.bHasCatFileWithFilters)
-	{
-		// Newer versions (2.9.3.windows.2) support smudge/clean filters used by Git LFS, git-fat, git-annex, etc
-		FullCommand += TEXT("cat-file --filters ");
-	}
-	else
-	{
-		// Previous versions fall-back on "git show" like before
-		FullCommand += TEXT("show ");
-	}
+	// Newer versions (2.9.3.windows.2) support smudge/clean filters used by Git LFS, git-fat, git-annex, etc
+	FullCommand += TEXT("cat-file --filters ");
 
 	// Append to the command the parameter
 	FullCommand += InParameter;
@@ -1326,7 +1510,7 @@ bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepository
 				{
 					if (BinaryData[BinaryData.Num() - 1] == 10) // Check for newline
 					{
-						BinaryData.Empty();
+						BinaryData.Reset();
 						bRemovedLFSMessage = true;
 					}
 				}
@@ -1369,7 +1553,7 @@ bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepository
 			// Save buffer into temp file
 			if (FFileHelper::SaveArrayToFile(BinaryFileContent, *InDumpFileName))
 			{
-				UE_LOG(LogSourceControl, Log, TEXT("Writed '%s' (%do)"), *InDumpFileName, BinaryFileContent.Num());
+				UE_LOG(LogSourceControl, Log, TEXT("Wrote '%s' (%do)"), *InDumpFileName, BinaryFileContent.Num());
 			}
 			else
 			{
@@ -1651,44 +1835,114 @@ TArray<FString> AbsoluteFilenames(const TArray<FString>& InFileNames, const FStr
 	return AbsFiles;
 }
 
-bool UpdateCachedStates(const TArray<FGitSourceControlState>& InStates)
+bool UpdateCachedStates(const TMap<const FString, FGitState>& InResults)
 {
-	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
+	if (InResults.Num() == 0)
+	{
+		return false;
+	}
+
+	FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
 	FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
-	const bool bUsingGitLfsLocking = GitSourceControl.AccessSettings().IsUsingGitLfsLocking();
+	const bool bUsingGitLfsLocking = Provider.UsesCheckout();
 
 	// TODO without LFS : Workaround a bug with the Source Control Module not updating file state after a simple "Save" with no "Checkout" (when not using File Lock)
-	const FDateTime Now = bUsingGitLfsLocking ? FDateTime::Now() : FDateTime();
+	const FDateTime Now = bUsingGitLfsLocking ? FDateTime::Now() : FDateTime::MinValue();
 
-	for (const auto& InState : InStates)
+	for (const auto& Pair : InResults)
 	{
-		TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> State = Provider.GetStateInternal(InState.LocalFilename);
-		*State = InState;
+		TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> State = Provider.GetStateInternal(Pair.Key);
+		const FGitState& NewState = Pair.Value;
+		if (NewState.FileState != EFileState::Unset)
+		{
+			// Invalid transition
+			if (NewState.FileState == EFileState::Added && !State->IsUnknown() && !State->CanAdd())
+			{
+				continue;
+			}
+			State->State.FileState = NewState.FileState;
+		}
+		if (NewState.TreeState != ETreeState::Unset)
+		{
+			State->State.TreeState = NewState.TreeState;
+		}
+		// If we're updating lock state, also update user
+		if (NewState.LockState != ELockState::Unset)
+		{
+			State->State.LockState = NewState.LockState;
+			State->State.LockUser = NewState.LockUser;
+		}
+		if (NewState.RemoteState != ERemoteState::Unset)
+		{
+			State->State.RemoteState = NewState.RemoteState;
+			if (NewState.RemoteState == ERemoteState::UpToDate)
+			{
+				State->State.HeadBranch = TEXT("");
+			}
+			else
+			{
+				State->State.HeadBranch = NewState.HeadBranch;
+			}
+		}
 		State->TimeStamp = Now;
 
 		// We've just updated the state, no need for UpdateStatus to be ran for this file again.
-		Provider.AddFileToIgnoreForceCache(InState.LocalFilename);
+		Provider.AddFileToIgnoreForceCache(State->LocalFilename);
 	}
 
-	return (InStates.Num() > 0);
+	return true;
 }
 
-bool UpdateCachedStates(const TArray<FString>& InFiles, EWorkingCopyState::Type WorkingState, TArray<FGitSourceControlState>& InStates)
+bool CollectNewStates(const TMap<FString, FGitSourceControlState>& InStates, TMap<const FString, FGitState>& OutResults)
 {
-	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
-	FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
-
-	TArray<TSharedRef<ISourceControlState, ESPMode::ThreadSafe>> LocalStates;
-	Provider.GetState(InFiles, LocalStates, EStateCacheUsage::Use);
-
-	for (auto& State : LocalStates)
+	if (InStates.Num() == 0)
 	{
-		auto NewState = StaticCastSharedRef<FGitSourceControlState>(State);
-		NewState->WorkingCopyState = WorkingState;
-		InStates.Add(NewState.Get());
+		return false;
+	}
+	
+	for (const auto& InState : InStates)
+	{
+		OutResults.Add(InState.Key, InState.Value.State);
 	}
 
-	return InStates.Num() > 0;
+	return true;
+}
+
+bool CollectNewStates(const TArray<FString>& InFiles, TMap<const FString, FGitState>& OutResults, EFileState::Type FileState, ETreeState::Type TreeState, ELockState::Type LockState, ERemoteState::Type RemoteState)
+{
+	if (InFiles.Num() == 0)
+	{
+		return false;
+	}
+
+	FGitState NewState;
+	NewState.FileState = FileState;
+	NewState.TreeState = TreeState;
+	NewState.LockState = LockState;
+	NewState.RemoteState = RemoteState;
+
+	for (const auto& File : InFiles)
+	{
+		FGitState& State = OutResults.FindOrAdd(File, NewState);
+		if (NewState.FileState != EFileState::Unset)
+		{
+			State.FileState = NewState.FileState;
+		}
+		if (NewState.TreeState != ETreeState::Unset)
+		{
+			State.TreeState = NewState.TreeState;
+		}
+		if (NewState.LockState != ELockState::Unset)
+		{
+			State.LockState = NewState.LockState;
+		}
+		if (NewState.RemoteState != ERemoteState::Unset)
+		{
+			State.RemoteState = NewState.RemoteState;
+		}
+	}
+
+	return true;
 }
 
 /**
@@ -1716,19 +1970,19 @@ struct FRemoveRedundantErrors
 void RemoveRedundantErrors(FGitSourceControlCommand& InCommand, const FString& InFilter)
 {
 	bool bFoundRedundantError = false;
-	for (auto Iter(InCommand.ErrorMessages.CreateConstIterator()); Iter; Iter++)
+	for (auto Iter(InCommand.ResultInfo.ErrorMessages.CreateConstIterator()); Iter; Iter++)
 	{
 		if (Iter->Contains(InFilter))
 		{
-			InCommand.InfoMessages.Add(*Iter);
+			InCommand.ResultInfo.InfoMessages.Add(*Iter);
 			bFoundRedundantError = true;
 		}
 	}
 
-	InCommand.ErrorMessages.RemoveAll(FRemoveRedundantErrors(InFilter));
+	InCommand.ResultInfo.ErrorMessages.RemoveAll(FRemoveRedundantErrors(InFilter));
 
 	// if we have no error messages now, assume success!
-	if (bFoundRedundantError && InCommand.ErrorMessages.Num() == 0 && !InCommand.bCommandSuccessful)
+	if (bFoundRedundantError && InCommand.ResultInfo.ErrorMessages.Num() == 0 && !InCommand.bCommandSuccessful)
 	{
 		InCommand.bCommandSuccessful = true;
 	}
@@ -1777,4 +2031,153 @@ TSharedPtr< class ISourceControlRevision, ESPMode::ThreadSafe > GetOriginDevelop
     return nullptr;
 }
 
+static TArray<FString> LockableTypes;
+
+bool IsFileLFSLockable(const FString& InFile)
+{
+	for (const auto& Type : LockableTypes)
+	{
+		if (InFile.EndsWith(Type))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool CheckLFSLockable(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InFiles, TArray<FString>& OutErrorMessages)
+{
+	TArray<FString> Results;
+	TArray<FString> Parameters;
+	Parameters.Add(TEXT("lockable")); // follow file renames
+
+	const bool bResults = RunCommand(TEXT("check-attr"), InPathToGitBinary, InRepositoryRoot, Parameters, InFiles, Results, OutErrorMessages);
+	if (!bResults)
+	{
+		return false;
+	}
+
+	for (int i = 0; i < InFiles.Num(); i++)
+	{
+		const FString& Result = Results[i];
+		if (Result.EndsWith("set"))
+		{
+			const FString FileExt = InFiles[i].RightChop(1); // Remove wildcard (*)
+			LockableTypes.Add(FileExt);
+		}
+	}
+
+	return true;
+}
+
+bool FetchRemote(const FString& InPathToGitBinary, const FString& InPathToRepositoryRoot, bool InUsingGitLfsLocking, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
+{
+	// Force refresh lock states
+	if (InUsingGitLfsLocking)
+	{
+		TMap<FString, FString> Locks;
+		GetAllLocks(InPathToRepositoryRoot, OutErrorMessages, Locks, true);
+	}
+	TArray<FString> Params{"--no-tags"};
+	// fetch latest repo
+	// TODO specify branches?
+	return RunCommand(TEXT("fetch"), InPathToGitBinary, InPathToRepositoryRoot, FGitSourceControlModule::GetEmptyStringArray(),
+					  FGitSourceControlModule::GetEmptyStringArray(), OutResults, OutErrorMessages);
+}
+
+bool PullOrigin(const FString& InPathToGitBinary, const FString& InPathToRepositoryRoot, const TArray<FString>& InFiles, TArray<FString>& OutFiles,
+				TArray<FString>& OutResults, TArray<FString>& OutErrorMessages)
+{
+	if (FGitSourceControlModule::Get().GetProvider().bPendingRestart)
+	{
+		FText PullFailMessage(LOCTEXT("Git_NeedBinariesUpdate_Msg", "Refused to Git Pull because your editor binaries are out of date.\n\n"
+																	"Without a binaries update, new assets can become corrupted or cause crashes due to format "
+																	"differences.\n\n"
+																	"Please exit the editor, and update the project."));
+		FText PullFailTitle(LOCTEXT("Git_NeedBinariesUpdate_Title", "Binaries Update Required"));
+		FMessageDialog::Open(EAppMsgType::Ok, PullFailMessage, &PullFailTitle);
+		UE_LOG(LogSourceControl, Log, TEXT("Pull failed because we need a binaries update"));
+		return false;
+	}
+
+	const TSet<FString> AlreadyReloaded {InFiles};
+
+	// Get remote branch
+	FString RemoteBranch;
+	if (!GetRemoteBranchName(InPathToGitBinary, InPathToRepositoryRoot, RemoteBranch))
+	{
+		// No remote to sync from
+		return false;
+	}
+
+	// Get the list of files which will be updated (either ones we changed locally, which will get potentially rebased or merged, or the remote ones that will update)
+	TArray<FString> DifferentFiles;
+	const bool bResultDiff = RunCommand(TEXT("diff"), InPathToGitBinary, InPathToRepositoryRoot, { TEXT("--name-only"), RemoteBranch }, FGitSourceControlModule::GetEmptyStringArray(), DifferentFiles, OutErrorMessages);
+	if (!bResultDiff)
+	{
+		return false;
+	}
+
+	// Nothing to pull
+	if (!DifferentFiles.Num())
+	{
+		return true;
+	}
+
+	const TArray<FString>& AbsoluteDifferentFiles = AbsoluteFilenames(DifferentFiles, InPathToRepositoryRoot);
+
+	if (AlreadyReloaded.Num())
+	{
+		OutFiles.Reserve(AbsoluteDifferentFiles.Num() - AlreadyReloaded.Num());
+		for (const auto& File : AbsoluteDifferentFiles)
+		{
+			if (!AlreadyReloaded.Contains(File))
+			{
+				OutFiles.Add(File);
+			}
+		}
+	}
+	else
+	{
+		OutFiles.Append(AbsoluteDifferentFiles);
+	}
+
+	TArray<FString> Files;
+	for (const auto& File : OutFiles)
+	{
+		if (IsFileLFSLockable(File))
+		{
+			Files.Add(File);
+		}
+	}
+
+	const bool bShouldReload = Files.Num() > 0;
+	TArray<UPackage*> PackagesToReload;
+	if (bShouldReload)
+	{
+		const auto PackagesToReloadResult = Async(EAsyncExecution::TaskGraphMainThread, [=] {
+			return UnlinkPackages(Files);
+		});
+		PackagesToReload = PackagesToReloadResult.Get();
+	}
+
+	// Reset HEAD and index to remote
+	TArray<FString> InfoMessages;
+	bool bSuccess = RunCommand(TEXT("pull"), InPathToGitBinary, InPathToRepositoryRoot, { "--rebase", "--autostash" }, FGitSourceControlModule::GetEmptyStringArray(),
+										  InfoMessages, OutErrorMessages);
+
+	if (bShouldReload)
+	{
+		const auto ReloadPackagesResult = Async(EAsyncExecution::TaskGraphMainThread, [=] {
+			TArray<UPackage*> Packages = PackagesToReload;
+			ReloadPackages(Packages);
+		});
+		ReloadPackagesResult.Wait();
+	}
+
+	return bSuccess;
+}
+
 } // namespace GitSourceControlUtils
+
+#undef LOCTEXT_NAMESPACE

@@ -13,11 +13,21 @@
 
 #define LOCTEXT_NAMESPACE "GitSourceControl"
 
+#if ENGINE_MAJOR_VERSION == 5
+bool FGitSourceControlRevision::Get( FString& InOutFilename, EConcurrency::Type InConcurrency ) const
+{
+	if (InConcurrency != EConcurrency::Synchronous)
+	{
+		UE_LOG(LogSourceControl, Warning, TEXT("Only EConcurrency::Synchronous is tested/supported for this operation."));
+	}
+#else
 bool FGitSourceControlRevision::Get( FString& InOutFilename ) const
 {
-	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
-	const FString PathToGitBinary = GitSourceControl.AccessSettings().GetBinaryPath();
-	const FString PathToRepositoryRoot = GitSourceControl.GetProvider().GetPathToRepositoryRoot();
+#endif
+	const FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
+	const FGitSourceControlProvider& Provider = GitSourceControl.GetProvider();
+	const FString PathToGitBinary = Provider.GetGitBinaryPath();
+	const FString PathToRepositoryRoot = Provider.GetPathToRepositoryRoot();
 
 	// if a filename for the temp file wasn't supplied generate a unique-ish one
 	if(InOutFilename.Len() == 0)

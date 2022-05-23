@@ -6,6 +6,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+
 #include "GitSourceControlState.h"
 
 class FGitSourceControlCommand;
@@ -105,6 +106,12 @@ void GetUserConfig(const FString& InPathToGitBinary, const FString& InRepository
 bool GetBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName);
 
 /**
+ * Get Git remote tracking branch
+ * @returns false if the branch is not tracking a remote
+ */
+bool GetRemoteBranchName(const FString& InPathToGitBinary, const FString& InRepositoryRoot, FString& OutBranchName);
+
+/**
  * Get Git current commit details
  * @param	InPathToGitBinary	The path to the Git binary
  * @param	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory
@@ -138,6 +145,21 @@ bool GetRemoteUrl(const FString& InPathToGitBinary, const FString& InRepositoryR
 bool RunCommand(const FString& InCommand, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages);
 
 /**
+ * Unloads packages of specified named files
+ */
+TArray<class UPackage*> UnlinkPackages(const TArray<FString>& InPackageNames);
+
+/**
+ * Reloads packages for these packages
+ */
+void ReloadPackages(TArray<UPackage*>& InPackagesToReload);
+
+/**
+ * Gets all Git tracked files, including within directories, recursively
+ */
+bool ListFilesInDirectoryRecurse(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString& InDirectory, TArray<FString>& OutFiles);
+
+/**
  * Run a Git "commit" command by batches.
  *
  * @param	InPathToGitBinary	The path to the Git binary
@@ -158,8 +180,8 @@ bool RunCommit(const FString& InPathToGitBinary, const FString& InRepositoryRoot
  * @param	OnePath				The file to be checked
  * @param	OutErrorMessages	Any errors (from StdErr) as an array per-line
  */
-void CheckRemote(const FString& CurrentBranchName, const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& OnePath,
-				 TArray<FString>& OutErrorMessages, TArray<FGitSourceControlState>& OutStates);
+void CheckRemote(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& Files,
+				 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlState>& OutStates);
 
 /**
  * Run a Git "status" command and parse it.
@@ -169,10 +191,11 @@ void CheckRemote(const FString& CurrentBranchName, const FString& InPathToGitBin
  * @param	InUsingLfsLocking	Tells if using the Git LFS file Locking workflow
  * @param	InFiles				The files to be operated on
  * @param	OutErrorMessages	Any errors (from StdErr) as an array per-line
- * @param bUseLfsCache If we should use the cache for LFS locks
+ * @param   OutStates           The resultant states
  * @returns true if the command succeeded and returned no errors
  */
-bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles, TArray<FString>& OutErrorMessages, TArray<FGitSourceControlState>& OutStates, bool bInvalidateCache = false);
+bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles,
+					 TArray<FString>& OutErrorMessages, TMap<FString, FGitSourceControlState>& OutStates);
 
 /**
  * Run a Git "cat-file" command to dump the binary content of a revision into a file.
@@ -214,12 +237,6 @@ TArray<FString> RelativeFilenames(const TArray<FString>& InFileNames, const FStr
 TArray<FString> AbsoluteFilenames(const TArray<FString>& InFileNames, const FString& InRelativeTo);
 
 /**
- * Helper function for various commands to update cached states.
- * @returns true if any states were updated
- */
-bool UpdateCachedStates(const TArray<FGitSourceControlState>& InStates);
-
-/**
  * Remove redundant errors (that contain a particular string) and also
  * update the commands success status if all errors were removed.
  */
@@ -227,19 +244,53 @@ void RemoveRedundantErrors(FGitSourceControlCommand& InCommand, const FString& I
 
 bool RunLFSCommand(const FString& InCommand, const FString& InRepositoryRoot, const TArray<FString>& InParameters, const TArray<FString>& InFiles, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages);
 
-bool UpdateCachedStates(const TArray<FString>& InFiles, EWorkingCopyState::Type WorkingState, TArray<FGitSourceControlState>& InStates);
+/**
+ * Helper function for various commands to update cached states.
+ * @returns true if any states were updated
+ */
+bool UpdateCachedStates(const TMap<const FString, FGitState>& InResults);
+
+/**
+* Helper function for various commands to collect new states.
+* @returns true if any states were updated
+*/
+bool CollectNewStates(const TMap<FString, FGitSourceControlState>& InStates, TMap<const FString, FGitState>& OutResults);
+	
+/**
+ * Helper function for various commands to collect new states.
+ * @returns true if any states were updated
+ */
+bool CollectNewStates(const TArray<FString>& InFiles, TMap<const FString, FGitState>& OutResults, EFileState::Type FileState, ETreeState::Type TreeState = ETreeState::Unset, ELockState::Type LockState = ELockState::Unset, ERemoteState::Type RemoteState = ERemoteState::Unset);
 
 /**
  * Run 'git lfs locks" to extract all lock information for all files in the repository
  *
- * @param	InPathToGitBinary	The path to the Git binary
  * @param	InRepositoryRoot	The Git repository from where to run the command - usually the Game directory
- * @param   bAbsolutePaths      Whether to report absolute filenames, false for repo-relative
  * @param	OutErrorMessages    Any errors (from StdErr) as an array per-line
  * @param	OutLocks		    The lock results (file, username)
  * @returns true if the command succeeded and returned no errors
  */
-bool GetAllLocks(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool bAbsolutePaths, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache = false);
+bool GetAllLocks(const FString& InRepositoryRoot, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks, bool bInvalidateCache = false);
+
+/**
+ * Gets locks from state cache
+ */
+void GetLockedFiles(const TArray<FString>& InFiles, TArray<FString>& OutFiles);
+
+/**
+ * Checks cache for if this file type is lockable
+ */
+bool IsFileLFSLockable(const FString& InFile);
+
+/**
+ * Gets Git attribute to see if these extensions are lockable
+ */
+bool CheckLFSLockable(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const TArray<FString>& InFiles, TArray<FString>& OutErrorMessages);
+
+bool FetchRemote(const FString& InPathToGitBinary, const FString& InPathToRepositoryRoot, bool InUsingGitLfsLocking, TArray<FString>& OutResults, TArray<FString>& OutErrorMessages);
+
+bool PullOrigin(const FString& InPathToGitBinary, const FString& InPathToRepositoryRoot, const TArray<FString>& InFiles, TArray<FString>& OutFiles,
+				TArray<FString>& OutResults, TArray<FString>& OutErrorMessages);
 
 
 TSharedPtr<class ISourceControlRevision, ESPMode::ThreadSafe > GetOriginDevelopRevision( const FString& InPathToGitBinary, const FString& InRepositoryRoot, const FString & InRelativeFileName, TArray<FString>& OutErrorMessages );
